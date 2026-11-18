@@ -454,7 +454,14 @@ def get_llvm_package_info(helper_args: BuildHelperArgs):
 def get_amd_codegen_package_info(helper_args: BuildHelperArgs):
     system_suffix = get_llvm_system_suffix(helper_args)
     if system_suffix is None:
-        raise RuntimeError("AMD code generation is unavailable for this platform; set TRITON_AMD_CODEGEN_PATH")
+        # No pre-built codegen binary for this platform.
+        # Return a Package with sha256sum=None so the caller falls through
+        # to build_amd_codegen() which builds from source.
+        print(f"WARNING: No pre-built AMD codegen binary for this platform "
+              f"({platform.system()}-{platform.machine()}). "
+              "Will build from source.")
+        return Package("amd-codegen", "", "", "LLVM_INCLUDE_DIRS",
+                       "LLVM_LIBRARY_DIR", "TRITON_AMD_CODEGEN_PATH")
 
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
@@ -563,6 +570,78 @@ def amd_codegen_library_name():
     return "libtriton_amd_codegen.so"
 
 
+def _build_codegen_llvm_from_source(backend: str, llvm_info: dict, helper_args: BuildHelperArgs):
+    """Build the bootstrap LLVM from source for platforms without pre-built binaries.
+
+    The bootstrap LLVM is a separate LLVM used only to compile the AMD codegen
+    shared library.  When pre-built binaries are not available for the host
+    platform, we build from source and cache the result.
+    """
+    import platform as _plat
+    llvm_hash = llvm_info["llvm_hash"]
+    short_hash = llvm_hash[:8]
+    arch = _plat.machine()
+    repo = llvm_info.get("repository", "triton-lang/llvm-project")
+    repo_url = f"https://github.com/{repo}.git"
+
+    cache_dir = os.path.join(helper_args.cache_path, backend, f"llvm-bootstrap-{arch}-{short_hash}")
+    install_dir = os.path.join(cache_dir, "install")
+    llvm_config = os.path.join(install_dir, "lib", "cmake", "llvm", "LLVMConfig.cmake")
+
+    if os.path.isfile(llvm_config):
+        print(f"Bootstrap LLVM for {backend} codegen ({arch}) already built: {install_dir}")
+        return install_dir
+
+    if helper_args.offline_build:
+        raise RuntimeError(
+            f"Offline build requested but no pre-built bootstrap LLVM for {arch}. "
+            f"Run an online build first to populate the cache at {cache_dir}")
+
+    print(f"Building bootstrap LLVM for {backend} codegen on {arch} (commit {short_hash})...")
+    print(f"  Repository: {repo_url}")
+    print("  This will take ~1 hour on the first run and is cached afterward.")
+
+    source_dir = os.path.join(cache_dir, "llvm-project")
+    build_dir = os.path.join(cache_dir, "build")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Clone
+    if not os.path.isdir(os.path.join(source_dir, ".git")):
+        subprocess.check_call(["git", "clone", "--depth", "1", repo_url, source_dir])
+    # Fetch the specific commit
+    try:
+        subprocess.check_call(["git", "fetch", "origin", llvm_hash, "--depth", "1"], cwd=source_dir)
+    except subprocess.CalledProcessError:
+        print("  Shallow fetch failed, unshallowing...")
+        subprocess.check_call(["git", "fetch", "--unshallow", "origin"], cwd=source_dir)
+        subprocess.check_call(["git", "fetch", "origin", llvm_hash], cwd=source_dir)
+    subprocess.check_call(["git", "checkout", llvm_hash], cwd=source_dir)
+
+    # Configure and build
+    max_jobs = os.environ.get("MAX_JOBS", str(2 * os.cpu_count()))
+    ninja_path = shutil.which("ninja")
+    command = [
+        "cmake",
+        "-G", "Ninja",
+        "-S", os.path.join(source_dir, "llvm"),
+        "-B", build_dir,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DLLVM_ENABLE_PROJECTS=mlir;lld;clang",
+        "-DLLVM_TARGETS_TO_BUILD=host;AMDGPU;NVPTX",
+        "-DLLVM_ENABLE_ASSERTIONS=ON",
+        f"-DCMAKE_INSTALL_PREFIX={install_dir}",
+        "-DLLVM_INSTALL_UTILS=ON",
+    ]
+    if ninja_path is not None:
+        command.append(f"-DCMAKE_MAKE_PROGRAM={ninja_path}")
+    subprocess.check_call(command)
+    subprocess.check_call(["cmake", "--build", build_dir, "--config", "Release", f"-j{max_jobs}"])
+    subprocess.check_call(["cmake", "--install", build_dir])
+
+    print(f"Bootstrap LLVM installed to: {install_dir}")
+    return install_dir
+
+
 def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelperArgs):
     # This SDK has its own pin and cache. Never consult llvm-info.json or
     # LLVM_SYSPATH, which configure Triton's core LLVM rather than this backend.
@@ -570,8 +649,8 @@ def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelpe
     bootstrap = llvm_info.get("bootstrap_llvm", {})
     checksum = bootstrap.get("sha256sum", {}).get(system_suffix)
     if checksum is None:
-        raise RuntimeError(
-            f"Missing {backend} code-generation artifact and bootstrap LLVM checksum for {system_suffix}")
+        # No pre-built bootstrap LLVM for this platform — build from source.
+        return _build_codegen_llvm_from_source(backend, llvm_info, helper_args)
     revision = llvm_info["llvm_hash"][:8]
     name = f"llvm-{revision}-{system_suffix}-{bootstrap['build_number']}"
     package_root = os.path.join(helper_args.cache_path, backend, "llvm")
